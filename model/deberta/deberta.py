@@ -35,6 +35,8 @@ from transformers.utils import logging
 from transformers.models.deberta.configuration_deberta import DebertaConfig
 
 
+from typing import List, Dict, Union, Tuple, Optional, Callable, Any
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DebertaConfig"
@@ -194,7 +196,7 @@ class StableDropout(nn.Module):
         super().__init__()
         self.drop_prob = drop_prob
         self.count = 0
-        self.context_stack = None
+        self.context_stack: List = None
 
     def forward(self, x):
         """
@@ -246,16 +248,20 @@ class DebertaLayerNorm(nn.Module):
 
     def forward(self, hidden_states):
         input_type = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        mean = hidden_states.mean(-1, keepdim=True)
+        hidden_states = hidden_states.float() 
+        mean = hidden_states.mean(-1, keepdim=True) # shape= [batch_size, seq_len, 1] 
         variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
         hidden_states = (hidden_states - mean) / torch.sqrt(variance + self.variance_epsilon)
         hidden_states = hidden_states.to(input_type)
+        # weight 广播到 hidden_states.shape
         y = self.weight * hidden_states + self.bias
         return y
 
 
 class DebertaSelfOutput(nn.Module):
+    '''
+    相当于 FFN
+    '''
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
@@ -271,7 +277,6 @@ class DebertaSelfOutput(nn.Module):
     
     
     
-
 
 class DebertaAttention(nn.Module):
     def __init__(self, config):
@@ -339,6 +344,66 @@ class DebertaLayer(nn.Module):
 
 class DebertaEncoder(nn.Module):
     """Modified BertEncoder with relative position bias support"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.layer = nn.ModuleList([DebertaLayer(config) for _ in range(config.num_hidden_layers)])
+        self.relative_attention = getattr(config, "relative_attention", False)
+        if self.relative_attention:
+            # 论文中的 k
+            self.max_relative_positions = getattr(config, "max_relative_positions", -1)
+            if self.max_relative_positions < 1:
+                self.max_relative_positions = config.max_position_embeddings
+            self.rel_embeddings = nn.Embedding(self.max_relative_positions * 2, config.hidden_size) # shape = (2k, d)
+
+    def get_rel_embedding(self):
+        rel_embeddings = self.rel_embeddings.weight if self.relative_attention else None
+        return rel_embeddings
+    
+
+    def get_attention_mask(self, attention_mask):
+        if attention_mask.dim() <= 2: # shape = (batch_size, seq_len) -> shape = [bz, 1, seq_len] -> shape = [bz, 1, seq_len, seq_len]
+           extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+           attention_mask = attention_mask.byte()
+           
+       
+        elif attention_mask.dim() == 3: # shape = [bz, seq_len, seq_len]
+           attention_mask = attention_mask.unsqueeze(1) # shape = [bz, 1, seq_len, seq_len]
+        
+        
+        return attention_mask
+    
+    
+    def get_rel_pos(self, hidden_states, query_states = None, relative_pos = None):
+        if self.relative_attention and relative_pos is None:
+            q = query_states.size(-2) if query_states is not None else hidden_states.size(-2)
+            relative_pos = build_relative_position(q, hidden_states.size(-2), device=hidden_states.device)
+        
+        return relative_pos
+    
+    
+    
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        output_hidden_states=True,
+        output_attentions=False,
+        query_states=None,
+        relative_pos=None,
+        return_dict=True,
+        past_key_values=None,
+    ):
+        pass
+        
+        
+    
+    
+    
+    
+    
+    
+    
 
 
 def build_relative_position(query_size, key_size, device):
