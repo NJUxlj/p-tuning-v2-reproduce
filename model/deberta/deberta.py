@@ -375,6 +375,9 @@ class DebertaEncoder(nn.Module):
     
     
     def get_rel_pos(self, hidden_states, query_states = None, relative_pos = None):
+        '''
+        return :relative_pos:`torch.LongTensor`: A tensor with shape [1, query_size, key_size]
+        '''
         if self.relative_attention and relative_pos is None:
             q = query_states.size(-2) if query_states is not None else hidden_states.size(-2)
             relative_pos = build_relative_position(q, hidden_states.size(-2), device=hidden_states.device)
@@ -385,7 +388,7 @@ class DebertaEncoder(nn.Module):
     
     def forward(
         self,
-        hidden_states,
+        hidden_states, 
         attention_mask,
         output_hidden_states=True,
         output_attentions=False,
@@ -394,11 +397,70 @@ class DebertaEncoder(nn.Module):
         return_dict=True,
         past_key_values=None,
     ):
-        pass
+        '''
+        ## Param:
+        :param: hidden_states, shape = [n_layers, bz, seq_len, d]
+        '''
+        attention_mask = self.get_attention_mask(attention_mask) # 把掩码的形状规范化到4维 [bz, 1, seq_len, seq_len]
+        relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos) # shape = [1, q, k]
+        
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
         
         
-    
-    
+        # hidden_states 是当前层的隐藏状态，它可能是一个序列（例如包含多层的输出），也可能是一个单一的张量。
+        if isinstance(hidden_states, Sequence):
+            # hidden_states 可能包含了多层的输出，而我们只需要取第一层的输出作为下一层的输入。
+            next_kv = hidden_states[0] # next_kv 主要用于存储下一个要处理的键值对, next_kv 存储了传递给下一层的输入
+        else:
+            next_kv = hidden_states # 表示当前层传进来的hidden_states 只是上一层的输出，并不包含再之前所有层的输出
+        rel_embeddings = self.get_rel_embedding()
+        
+        for i, layer_module in enumerate(self.layer):
+
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            # 里面存放了每一层的前缀 token embedding
+            past_key_value = past_key_values[i] if past_key_values is not None else None
+
+            hidden_states = layer_module.forward(
+                next_kv,
+                attention_mask,
+                output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+                past_key_value=past_key_value,  
+            ) # shape = [bz, seq_len, d], 此时的 hidden_states 已经包含第0~i 层的所有隐状态
+            
+            
+            if output_attentions:
+                hidden_states, att_m = hidden_states
+
+            if query_states is not None:
+                query_states = hidden_states
+                if isinstance(hidden_states, Sequence):
+                    next_kv = hidden_states[i + 1] if i + 1 < len(self.layer) else None
+            else:
+                next_kv = hidden_states # 要传到下一个layer中的输入
+
+            if output_attentions:
+                all_attentions = all_attentions + (att_m,)
+                
+        
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            
+        
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+        )
     
     
     
@@ -420,8 +482,48 @@ def build_relative_position(query_size, key_size, device):
 
     Return:
         :obj:`torch.LongTensor`: A tensor with shape [1, query_size, key_size]
-
+        
+        
+    ## Function:
+    for example:
+            q_ids = [
+                    [0, 0, 0, 0, 0, 0],
+                    [1, 1, 1, 1, 1, 1],
+                    [2, 2, 2, 2, 2, 2],
+                    [3, 3, 3, 3, 3, 3],
+                    [4, 4, 4, 4, 4, 4],
+                ]
+        
+        k_ids = [
+                    [0, 1, 2, 3, 4, 5],
+                    [0, 1, 2, 3, 4, 5],
+                    [0, 1, 2, 3, 4, 5],
+                    [0, 1, 2, 3, 4, 5],
+                    [0, 1, 2, 3, 4, 5],
+                ]
+                
+        q_ids - k_ids = [
+                    [0, 1, 2, 3, 4, 5],
+                    [-1, 0, 1, 2, 3, 4],
+                    [-2, -1, 0, 1, 2, 3],
+                    [-3, -2, -1, 0, 1, 2],
+                    [-4, -3, -2, -1, 0, 1],
+                ] 
+        ]
     """
+    
+    q_ids = torch.arange(query_size, dtype=torch.long, device=device)
+    k_ids = torch.arange(key_size, dtype=torch.long, device=device)
+    rel_pos_ids = q_ids[:, None] - k_ids.view(1, -1).repeat(query_size, 1) # shape = [q, k]
+    rel_pos_ids = rel_pos_ids[:query_size, :]
+    
+    rel_pos_ids = rel_pos_ids.unsqueeze(0)
+    
+    return rel_pos_ids
+    
+
+    
+    
 
 class DisentangledSelfAttention(nn.Module):
     """
@@ -439,11 +541,69 @@ class DebertaEmbeddings(nn.Module):
     pass
         
         
+        
+        
+        
+        
+        
+        
+        
+        
 class DebertaPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
+    
+    config_class = DebertaConfig
+    base_model_prefix = "deberta"
+    _keys_to_ignore_on_load_missing = ["position_ids"] # 在加载预训练模型时，如果缺少 "position_ids" 这个键，将忽略该错误。
+    _keys_to_ignore_on_load_unexpected = ["position_embeddings"] # 在加载预训练模型时，如果出现 "position_embeddings" 这个意外的键，将忽略该错误。
+    
+    def __init__(self, config):
+        super().__init__(config)
+        '''
+        注册一个预加载钩子函数 self._pre_load_hook，
+            该钩子函数会在加载模型状态字典之前被调用，用于对加载过程进行一些预处理。
+        '''
+        self._register_load_state_dict_pre_hook(self._pre_load_hook)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data._normal(mean=0.0, std=self.config.initializer_range)
+        
+            if module.bias is not None:
+                module.bias.data._zero()
+        
+        elif isinstance(module, nn.Embedding):
+            module.weight.data._normal(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx]._zero()
+    
+    
+    
+    def _pre_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """
+        Removes the classifier if it doesn't have the correct number of labels.
+        """
+        # 从 state_dict 中移除 "classifier.weight" 和 "classifier.bias" 这两个键
+        self_state = self.state_dict()
+        
+        if (
+            ("classifier.weight" in self_state)
+            and ("classifier.weight" in state_dict)
+            and self_state["classifier.weight"].size() != state_dict["classifier.weight"].size()
+        ): # 模型自身的分类器权重与外面传进来的分类器权重大小不一致
+            logger.warning(
+                f"The checkpoint classifier head has a shape {state_dict['classifier.weight'].size()} and this model "
+                f"classifier head has a shape {self_state['classifier.weight'].size()}. Ignoring the checkpoint "
+                f"weights. You should train your model on new data."
+            )
+            
+            del state_dict["classifier.weight"]
+            if "classifier.bias" in state_dict:
+                del state_dict["classifier.bias"]
+        
 
 
 
