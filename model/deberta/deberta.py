@@ -595,11 +595,34 @@ def c2p_dynamic_expand(c2p_pos, query_layer, relative_pos):
 
 @torch.jit.script
 def p2c_dynamic_expand(c2p_pos, query_layer, key_layer):
+    '''
+    ##Args:
+        c2p_pos: 相对位置索引，形状为 [1, 1, q_size, k_size]
+
+        query_layer: 用于计算注意力的查询层，形状为 [bz, num_heads, seq_len, head_size]
+
+        key_layer: 用于计算注意力的键层，形状为 [bz, num_heads, seq_len, head_size]
+        
+    ## return
+    扩展后的索引张量，形状为 [bz, num_heads, key_len, key_len]
+
+    '''
     return c2p_pos.expand([query_layer.size(0), query_layer.size(1), key_layer.size(-2), key_layer.size(-2)])
 
 
 @torch.jit.script
 def pos_dynamic_expand(pos_index, p2c_att, key_layer):
+    '''
+    ##Args:
+        pos_index: 相对位置索引，形状为 pos_idx.shape = (B, H, Q_LEN, 1)  
+
+        p2c_att: 位置到内容注意力矩阵，形状为    [bz, num_heads, query_len, key_len, ]
+                                        
+        key_layer.shape = [bz, num_heads, key_len, head_size]
+        
+    ## return:
+        扩展后的索引张量，形状为 [bz, num_heads, q_len, k_len]
+    '''
     return pos_index.expand(p2c_att.size()[:2] + (pos_index.size(-2), key_layer.size(-2)))
     
 
@@ -849,8 +872,8 @@ class DisentangledSelfAttention(nn.Module):
         
         if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
             # 计算相对位置的注意力分数 Q_r
-            pos_q_layer = self.pos_q_proj(rel_embeddings)
-            pos_q_layer = self.transpose_for_scores(pos_q_layer) # shape = [1, 2k, num_heads, head_size]
+            pos_query_layer = self.pos_q_proj(rel_embeddings)
+            pos_query_layer = self.transpose_for_scores(pos_query_layer) # shape = [1, num_heads, 2k, head_size]
             
         
         score = 0
@@ -869,17 +892,65 @@ class DisentangledSelfAttention(nn.Module):
             # torch.gather 是 PyTorch 中的一个高级索引操作。
             # 它从指定维度（dim=-1）中，根据提供的 index 张量提取对应的值。
             # 这一行的作用是，从 c2p_att 中提取与动态位置索引（由 c2p_dynamic_expand 生成）对应的注意力分数。
-            c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_dynamic_expand(c2p_pos, query_layer, relative_pos))
+            # 对应解耦注意力中 K_r的下标：delta(i,j)， 把c2p[i,j] 替换成 c2p[i][delta(i,j)}, delta就是index矩阵
+            c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_dynamic_expand(c2p_pos, query_layer, relative_pos)) # index.shape = [bz, num_heads, seq_len, k_size]
             score += c2p_att
 
         # position->content
         if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
-            pass
-        
+            # [1] 位置查询归一化  
+            # 原始形状：pos_query_layer.shape = (B, H, P_LEN, D)  
+            # 其中 P_LEN=2*att_span 是位置编码的总长度（左右两个方向）  
+            pos_query_layer /= math.sqrt(scale_factor * query_layer.shape[-1] ) # sqrt(3d) shape = [1, num_heads, 2k, head_size]
+            
+            # [2] 构建新的相对位置矩阵（当Q≠K时）（如encoder-decoder结构）  
+            if query_layer.size(-2) != key_layer.size(-2):
+                # 获取query和key之间的相对位置矩阵
+                r_pos = build_relative_position(
+                    key_layer.size(-2), key_layer.size(-2), device = query_layer.device
+                ) # shape = [1, key_size, key_size]
+                # 示例：当K_LEN=5时，生成从-4到4的相对位置矩阵 
+            else:
+                r_pos = relative_pos # (B,H,Q,K)  
+                
+            # [3] 位置索引映射（镜像翻转） 
+            # 原始r_pos范围：[-att_span, att_span] 
+            p2c_pos = torch.clamp(-r_pos + att_span, 0, 2*att_span-1) # shape = [1, 1, k_size, k_size]
+            # 操作解析：将位置i->j映射为j->i的位置编码  
+            # 示例：当att_span=4时：  
+            #   original pos: -4 → 8 (因为 -(-4)+4=8)  
+            #   pos 2 → -2+4=2 → clamp后保持2  
+            # 形状变化：保持与r_pos相同 (B, H, Q_LEN, K_LEN) 或 (1, K_LEN, K_LEN)  
+            
+            if query_layer.size(-2) != key_layer.size(-2):
+                pos_index = relative_pos[:, :, :, 0].unsqueeze(-1) 
+                # 分解动作：  
+                    # relative_pos[:,:,:,0] → 取每个key位置的第0个相对位置 → (B, H, Q_LEN)  
+                    # unsqueeze(-1) → (B, H, Q_LEN, 1)  
+                    # 作用：为后续的gather操作准备索引  
         
         if "p2c" in self.pos_att_type:
-            pass
-        
+            # key_layer.shape = [bz, num_heads, key_len, head_size]
+            # pos_query_layer.shape = [1, num_heads, 2k, head_size] where 2k == P_LEN
+            p2c_att = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2)) # shape = # (B,H,K_LEN,P_LEN) 
+            # 对应解耦注意力中 Q_r的下标：delta(j,i)， 把p2c[j,i] 替换成 p2c[j][delta(j,i)}, delta就是index矩阵
+
+            p2c_att = torch.gather(
+                # p2c_att.shape = (B,H,K_LEN,P_LEN)
+                # p2c_pos.shape = (1, K_LEN, K_LEN)  
+                # index.shape =  [bz, num_heads, key_len, key_len]
+                p2c_att, dim=-1, index = p2c_dynamic_expand(p2c_pos, key_layer, relative_pos)
+            ).transpose(-1,-2) # shape =  [bz, num_heads, key_len, key_len]
+            
+            # [3] 跨序列长度对齐
+            if query_layer.size(-2) != key_layer.size(-2):
+                # pos_idx.shape = (B, H, Q_LEN, 1)  
+                # p2c_att.shape = [bz, num_heads, query_len, key_len]
+                index = pos_dynamic_expand(pos_index, p2c_att, key_layer) # shape = [bz, n_heads, q_len, k_len]
+                p2c_att = torch.gather(
+                    p2c_att, dim=-2, index=index
+                ) # shape = [bz, num_heads, q_len, k_len]
+                score += p2c_att
         
         
         return score
