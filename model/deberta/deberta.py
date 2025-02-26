@@ -357,6 +357,41 @@ class DebertaLayer(nn.Module):
         self.attention = DebertaAttention(config)
         self.intermediate = DebertaIntermediate(config)
         self.output = DebertaOutput(config)
+        
+        
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        return_att = False,
+        query_states = None,
+        relative_pos = None,
+        rel_embeddings = None,
+        past_key_value = None,
+    ):
+        attention_output = self.attention.forward(
+            hidden_states,
+            attention_mask,
+            return_att = return_att,
+            query_states = query_states,
+            relative_pos = relative_pos,
+            rel_embeddings = rel_embeddings,
+            past_key_value = past_key_value,
+        )
+        
+        if return_att:
+            attention_output, att_matrix = attention_output
+        
+        intermediate_output  = self.intermediate(attention_output)
+        layer_output = self.output(intermediate_output, attention_output)
+        
+        if return_att:
+            return (layer_output, att_matrix)
+        else:
+            return layer_output
+        
+            
+        
 
 
 
@@ -540,7 +575,20 @@ def build_relative_position(query_size, key_size, device):
     return rel_pos_ids
     
 
-    
+
+
+@torch.jit.script
+def c2p_dynamic_expand(c2p_pos, query_layer, relative_pos):
+    return c2p_pos.expand([query_layer.size(0), query_layer.size(1), query_layer.size(2), relative_pos.size(-1)])
+
+@torch.jit.script
+def p2c_dynamic_expand(c2p_pos, query_layer, key_layer):
+    return c2p_pos.expand([query_layer.size(0), query_layer.size(1), key_layer.size(-2), key_layer.size(-2)])
+
+
+@torch.jit.script
+def pos_dynamic_expand(pos_index, p2c_att, key_layer):
+    return pos_index.expand(p2c_att.size()[:2] + (pos_index.size(-2), key_layer.size(-2)))
     
 
 class DisentangledSelfAttention(nn.Module):
@@ -553,10 +601,231 @@ class DisentangledSelfAttention(nn.Module):
             `BertConfig`, for more details, please refer :class:`~transformers.DebertaConfig`
 
     """
+    def __init__(self, config):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        # in_proj 将输入的特征投影到查询、键和值的空间中。
+        self.in_proj = nn.Linear(config.hidden_size, self.all_head_size * 3, bias=False)
+        
+        # 偏置项创新点：仅对Q和V添加可学习偏置
+        self.q_bias = nn.Parameter(torch.zeros((self.all_head_size), dtype=torch.float))
+        self.v_bias = nn.Parameter(torch.zeros((self.all_head_size), dtype=torch.float))
+        
+        # 相对位置编码相关 
+        # self.pos_att_type 用于指定使用哪种位置注意力机制
+            # 一共有3种位置注意力机制：
+            # "p2c": 位置到内容注意力机制，`将位置信息投影到内容空间中`，然后计算内容和位置之间的注意力。
+            # "c2p": 内容到位置注意力机制，将内容信息投影到位置空间中，然后计算内容和位置之间的注意力。
+            # "c2c": 内容到内容注意力机制，将内容信息投影到内容空间中，然后计算内容和内容之间的注意力。
+        self.pos_att_type = config.pos_att_type if config.pos_att_type is not None else []
+
+        self.relative_attention = getattr(config, "relative_attention", False)
+        self.talking_head = getattr(config, "talking_head", False)
+
+        if self.talking_head:
+            self.head_logits_proj = nn.Linear(config.num_attention_heads, config.num_attention_heads, bias=False)
+            self.head_weights_proj = nn.Linear(config.num_attention_heads, config.num_attention_heads, bias=False)
+
+        if self.relative_attention:
+            self.max_relative_positions = getattr(config, "max_relative_positions", -1)
+            if self.max_relative_positions < 1:
+                self.max_relative_positions = config.max_position_embeddings
+            self.pos_dropout = StableDropout(config.hidden_dropout_prob)
+
+            if "c2p" in self.pos_att_type or "p2p" in self.pos_att_type:
+                # pos_proj = W_{k,r} \in R^{d x d},
+                self.pos_proj = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+            if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
+                # W_{q,r} \in R^{d x d}
+                self.pos_q_proj = nn.Linear(config.hidden_size, self.all_head_size)
+
+        self.dropout = StableDropout(config.attention_probs_dropout_prob)
+            
+            
+    def transpose_for_scores(self, x):
+        '''
+        x.shape = [bz, seq_len, hidden_size]
+        '''
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, -1) # shape = [bz, seq_len, num_heads, head_size]
+        
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3) # shape = (bz, num_heads, seq_len, head_size)
+    
+    
+    
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        return_att=False,
+        query_states=None,
+        relative_pos=None,
+        rel_embeddings=None,
+        past_key_value=None,
+    ):
+        """
+        Call the module
+
+        ## Args:
+            hidden_states (:obj:`torch.FloatTensor`):
+                Input states to the module usually the output from previous layer, it will be the Q,K and V in
+                `Attention(Q,K,V)`
+
+            attention_mask (:obj:`torch.ByteTensor`):
+                An attention mask matrix of shape [`B`, `N`, `N`] where `B` is the batch size, `N` is the maximum
+                sequence length in which element [i,j] = `1` means the `i` th token in the input can attend to the `j`
+                th token.
+
+            return_att (:obj:`bool`, optional):
+                Whether return the attention matrix.
+
+            query_states (:obj:`torch.FloatTensor`, optional):
+                The `Q` state in `Attention(Q,K,V)`.
+
+            relative_pos (:obj:`torch.LongTensor`):
+                The relative position encoding between the tokens in the sequence. It's of shape [`B`, `N`, `N`] with
+                values ranging in [`-max_relative_positions`, `max_relative_positions`].
+
+            rel_embeddings (:obj:`torch.FloatTensor`):
+                The embedding of relative distances. It's a tensor of shape [:math:`2 \\times
+                \\text{max_relative_positions}`, `hidden_size`].
+                
+                
+                
+            past_key_value.shape =  tuple(key_layer, value_layer), key_layer.shape = value_layer.shape = [bz, num_heads, prefix_seq_len, head_size]
+
+
+        """
+        
+        if query_states is None:
+            qp = self.in_proj(hidden_states)  # shape = [bz, seq_len, 3 * hidden_size]
+            query_layer, key_layer, value_layer = self.transpose_for_scores(qp).chunk(3, dim=-1)
+            # query_layer.shape = [key_layer.shape] = [bz, num_heads, seq_len, head_size] 
+        else:
+            # in_proj.shape = [3 * num_heads, head_size]
+            ws = self.in_proj.weight.chunk(self.num_attention_heads * 3, dim = 0) # shape = [3 * num_heads, head_size]
+            # ws[0]
+            qkvw = [torch.cat([ws[3*i + k] for i in range(self.num_attention_heads)], dim = 0) for k in range(3)] # shape = [3, num_heads, head_size]
+            qkvb = [None] * 3
+            
+            q = self.linear(qkvw[0], qkvb[0], query_states) #  (num_heads, head_size) x (head_size, num_heads) = (num_heads, num_heads) 
+            k, v = [self.linear(qkvw[i], qkvb[i], hidden_states) for i in range(1,3)]
+            query_layer, key_layer, value_layer = [self.transpose_for_scores(x) for x in [q, k, v]]
+            
+            
+        query_layer =  query_layer + self.transpose_for_scores(self.q_bias[None, None,:])
+        value_layer = value_layer + self.transpose_for_scores(self.v_bias[None, None, :])
+        
+        rel_att = None
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        scale_factor = 1 + len(self.pos_att_type)
+        scale = math.sqrt(query_layer.size(-1) * scale_factor) # sqrt(3x dk)
+
+        past_key_value_length = past_key_value.shape[3] if past_key_value is not None else 0
+        
+        if past_key_value is not None:
+            key_layer_prefix = torch.cat([past_key_value[0], key_layer], dim = 2) # shape = [bz, num_heads, past_key_value_length + seq_len, head_size]
+            value_layer_prefix = torch.cat([past_key_value[1], value_layer], dim=2) # shape = [bz, num_heads, past_key_value_length + seq_len, head_size]
+        else:
+            key_layer_prefix = key_layer # 没有前缀的情况， key_layer_prefix.shape = key_layer.shape =  [bz, num_heads, seq_len, head_size]
+
+
+        query_layer /= scale
+        # 计算标准的注意力分数
+        # query_layer.shape = [bz, seq_len, head_size]
+        attention_scores = torch.matmul(query_layer, key_layer_prefix.transpose(-1, -2))
+        
+        if self.relative_attention:
+            rel_embeddings = self.pos_dropout(rel_embeddings)
+            rel_att = self.disentangled_att_bias(query_layer, key_layer, relative_pos, rel_embeddings, scale_factor)
+        
+        if rel_att is not None:
+            if past_key_value is not None:
+                att_shape = None
+            else:
+                attention_scores += rel_att
+                
+        # shape = (bz, nheads, seqlen, d)
+        if self.talking_head: # talk-head 机制： 在softmax前后，分别过一次投影
+            attention_scores = self.head_logits_proj(attention_scores)
+        
+        softmax_mask = attention_mask[:,:,past_key_value_length:, :]
+        
+    
+    def linear(self,w,b,x):
+        '''
+        w.shape = [bz, seq_len, hidden_size]
+        b.shape = [bz, seq_len, hidden_size]
+        x.shape = [bz, seq_len, hidden_size]
+        '''
+        if b is not None:
+            return torch.matmul(x, w.t()) + b.t()
+        else:
+            return torch.matmul(x, w.t())
+    
+    def disentangled_att_bias(self, query_layer, key_layer, relative_pos, rel_embeddings, scale_factor):
+        '''
+        ##Function:
+        计算位置注意力的偏置项
+        具体流程：
+            1. 计算相对位置的编码
+            2. 计算相对位置的注意力分数
+            3. 计算注意力分数
+        ## Args:
+            query_layer.shape = key_layer.shape = value_layer.shape = [bz, num_heads, seq_len, head_size]
+            relative_pos.shape = [bz, seq_len, seq_len]
+            rel_embeddings.shape = [2k, d]
+        '''
+        
+        if relative_pos is None:
+            q_len = query_layer.size(-2) # query_len
+            k_len = key_layer.size(-2)
+            relative_pos = build_relative_position(q_len, k_len, device = query_layer.device) # shape = [1, q_size, k_size]
+    
+        if relative_pos.dim()==2:
+            relative_pos = relative_pos.unsqueeze(0).unsqueeze(0)
+            
+        elif relative_pos.dim()==3:
+            relative_pos = relative_pos.unsqueeze(1)
+            
+        elif relative_pos.dim() != 4:
+            raise ValueError(f"The shape of relative_pos must be 2 or 3 or 4. {relative_pos.dim()}")
+    
+        att_span = min(max(query_layer.size(-2),key_layer.size(-2)), self.max_relative_positions) # <= max_relative_positions
+        relative_pos = relative_pos.long().to(query_layer.device)
+        rel_embeddings = rel_embeddings[
+            self.max_relative_positions - att_span: self.max_relative_positions + att_span, :
+        ].unsqueeze(0) # shape = [1, 2k, d], where att_span==k
+        
+        
+        if "c2p" in self.pos_att_type or "p2p" in self.pos_att_type:
+            # 计算相对位置的编码 K_r
+            pos_key_layer = self.pos_proj(rel_embeddings) # shape = [2k, d]  K_r = P x W_{k,r}, where P = relative position embedding vectors, W_{k,r} = projection matrix
+            pos_key_layer = self.transpose_for_scores(pos_key_layer) # shape = [2k, num_heads, head_size]
+        
+        if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
+            # 计算相对位置的注意力分数 Q_r
+            pos_q_layer = self.pos_q_proj(rel_embeddings)
+            pos_q_layer = self.transpose_for_scores(pos_q_layer)
+            
+        
+        score = 0
+        
         
 class DebertaEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""       
-    pass
+    def __init__(self, config):
+        super().__init__()
+        pad_token_id = getattr(config, "pad_token_id", 0)
+        self.embedding_size = getattr(config, "embedding_size", config.hidden_size)
+        self.word_embeddings = nn.Embedding(config.vocab_size, self.embedding_size, padding_idx=pad_token_id)
         
         
         
