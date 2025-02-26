@@ -579,6 +579,18 @@ def build_relative_position(query_size, key_size, device):
 
 @torch.jit.script
 def c2p_dynamic_expand(c2p_pos, query_layer, relative_pos):
+    '''
+    ##Args:
+    c2p_pos: 相对位置索引，形状为 [1, 1, q_size, k_size]
+            # relative_pos.shape = (1, 1, q_size, k_size)
+            # query_layer.shape = [bz, num_heads, seq_len, head_size]
+
+    将相对位置索引（c2p_pos）扩展成与 query_layer 的形状匹配的索引张量。
+    
+    
+    ## return 
+    扩展后的索引张量，形状为 [bz, num_heads, seq_len, k_size]
+    '''
     return c2p_pos.expand([query_layer.size(0), query_layer.size(1), query_layer.size(2), relative_pos.size(-1)])
 
 @torch.jit.script
@@ -652,6 +664,9 @@ class DisentangledSelfAttention(nn.Module):
     def transpose_for_scores(self, x):
         '''
         x.shape = [bz, seq_len, hidden_size]
+        
+        ## return
+        x.shape = (bz, num_heads, seq_len, head_size)
         '''
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, -1) # shape = [bz, seq_len, num_heads, head_size]
         
@@ -721,7 +736,7 @@ class DisentangledSelfAttention(nn.Module):
             
             
         query_layer =  query_layer + self.transpose_for_scores(self.q_bias[None, None,:])
-        value_layer = value_layer + self.transpose_for_scores(self.v_bias[None, None, :])
+        value_layer = value_layer + self.transpose_for_scores(self.v_bias[None, None, :]) # shape = [bz, num_heads, seq_len, head_size]
         
         rel_att = None
         # Take the dot product between "query" and "key" to get the raw attention scores.
@@ -739,11 +754,12 @@ class DisentangledSelfAttention(nn.Module):
 
         query_layer /= scale
         # 计算标准的注意力分数
-        # query_layer.shape = [bz, seq_len, head_size]
+        # query_layer.shape = [bz, num_heads, seq_len, head_size]
         attention_scores = torch.matmul(query_layer, key_layer_prefix.transpose(-1, -2))
         
         if self.relative_attention:
             rel_embeddings = self.pos_dropout(rel_embeddings)
+            # query_layer.shape = [bz, num_heads, seq_len, head_size]
             rel_att = self.disentangled_att_bias(query_layer, key_layer, relative_pos, rel_embeddings, scale_factor)
         
         if rel_att is not None:
@@ -757,6 +773,26 @@ class DisentangledSelfAttention(nn.Module):
             attention_scores = self.head_logits_proj(attention_scores)
         
         softmax_mask = attention_mask[:,:,past_key_value_length:, :]
+        
+        attention_probs = XSoftmax.apply(attention_scores, softmax_mask, dim=-1)
+        attention_probs = self.dropout(attention_probs) # shape = (bz, nheads, seqlen, seqlen)
+
+        if self.talking_head:
+            
+            # a1 = attention_probs.permute(0,2,3,1).shape = (bz, seqlen, seqlen, nheads)
+            #  a2 = (nheads, nheads) x a1.shape =  (bz, seqlen, seqlen, nheads)
+            # a2.permute = (bz, nheads, seqlen, seqlen)
+            attention_probs = self.head_weights_proj(attention_probs.permute(0,2,3,1)).permute(0,3,1,2)
+        
+        context_layer = torch.matmul(attention_probs, value_layer)  # shape = (bz, nheads, seqlen, d)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous() 
+        new_context_layer_shape = context_layer.size()[:-2] + (-1,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        if return_att:
+            return (context_layer, attention_probs)
+        else:
+            return context_layer
         
     
     def linear(self,w,b,x):
@@ -797,7 +833,8 @@ class DisentangledSelfAttention(nn.Module):
             
         elif relative_pos.dim() != 4:
             raise ValueError(f"The shape of relative_pos must be 2 or 3 or 4. {relative_pos.dim()}")
-    
+
+        # 注意力跨度，即，模型能够感知的最大相对位置范围。
         att_span = min(max(query_layer.size(-2),key_layer.size(-2)), self.max_relative_positions) # <= max_relative_positions
         relative_pos = relative_pos.long().to(query_layer.device)
         rel_embeddings = rel_embeddings[
@@ -807,16 +844,45 @@ class DisentangledSelfAttention(nn.Module):
         
         if "c2p" in self.pos_att_type or "p2p" in self.pos_att_type:
             # 计算相对位置的编码 K_r
-            pos_key_layer = self.pos_proj(rel_embeddings) # shape = [2k, d]  K_r = P x W_{k,r}, where P = relative position embedding vectors, W_{k,r} = projection matrix
-            pos_key_layer = self.transpose_for_scores(pos_key_layer) # shape = [2k, num_heads, head_size]
+            pos_key_layer = self.pos_proj(rel_embeddings) # shape = [1, 2k, d] = [1, 2k, d] x [d, d]  K_r = P x W_{k,r}, where P = relative position embedding vectors, W_{k,r} = projection matrix
+            pos_key_layer = self.transpose_for_scores(pos_key_layer) # shape = [1, 2k, num_heads, head_size]
         
         if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
             # 计算相对位置的注意力分数 Q_r
             pos_q_layer = self.pos_q_proj(rel_embeddings)
-            pos_q_layer = self.transpose_for_scores(pos_q_layer)
+            pos_q_layer = self.transpose_for_scores(pos_q_layer) # shape = [1, 2k, num_heads, head_size]
             
         
         score = 0
+        # content->position
+        if "c2p" in self.pos_att_type:
+            # query_layer.shape = [bz, num_heads, seq_len, head_size]
+            # pos_key_layer.shape = [1, 2k, num_heads, head_size]
+            c2p_att = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2)) # 广播乘法 shape = [max(bz, 1), max(num_heads, 2k), seq_len, num_heads]
+
+            # relative_pos.shape = (1, 1, q_size, k_size)
+            # query_layer.shape = [bz, num_heads, seq_len, head_size]
+            # torch.clamp 是一个 PyTorch 函数，用于将张量中的值限制在指定范围内
+            # 这里，将 relative_pos + att_span 的值限制在 [0, 2*att_span-1] 范围内
+            c2p_pos = torch.clamp(relative_pos + att_span, 0, att_span * 2 - 1) # 将相对位置索引映射到一个非负范围
+            
+            # torch.gather 是 PyTorch 中的一个高级索引操作。
+            # 它从指定维度（dim=-1）中，根据提供的 index 张量提取对应的值。
+            # 这一行的作用是，从 c2p_att 中提取与动态位置索引（由 c2p_dynamic_expand 生成）对应的注意力分数。
+            c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_dynamic_expand(c2p_pos, query_layer, relative_pos))
+            score += c2p_att
+
+        # position->content
+        if "p2c" in self.pos_att_type or "p2p" in self.pos_att_type:
+            pass
+        
+        
+        if "p2c" in self.pos_att_type:
+            pass
+        
+        
+        
+        return score
         
         
 class DebertaEmbeddings(nn.Module):
