@@ -4,7 +4,7 @@ Reproduce a prompt-learning method: P-Tuning V2, from the paper 《P-Tuning v2: 
 - This project is a reproduce from this repo: [P-Tuning V2](https://github.com/THUDM/P-tuning-v2/tree/main)
 - but we do add some additional changes and additional models: `ChatGLM2`
 
-![ptuning_v2](image/ptuning_v2.png.png)
+![ptuning_v2](image/ptuning_v2.png)
 
 
 ## Environment Config
