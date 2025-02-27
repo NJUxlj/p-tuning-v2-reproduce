@@ -1657,6 +1657,22 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
                     labeled_logits = torch.gather(logits, 0, index=label_index.expand(label_index.size(0), logits.size(1)))  # shape =  (sb, num_labels)
                     labels = torch.gather(labels, 0, label_index.view(-1)) #shape = (sb, )
                     
+                    '''
+                    一句话说清gather的作用：
+                        - 概括：
+                            对于一个二维张量 tensor，gather 函数的作用是根据给定的索引 index，从 tensor 中提取相应的元素。
+                        
+                        - gather后的new_logits.shape = index.shape, 要做到这一点，我们需确保 logits.shape >= index.shape
+
+                        - 如果 dim = 0:
+                        - new_logits[i][j] = logits[index[i][j]][j]
+                        
+                        - 如果 index矩阵中的值全为1 (首先第一个index列就是全1，横向扩展后也是全1)，那么无论i取哪一行，new_logits[i][j] 最终都会被映射会 logits[1][j]
+                        - 而此时，在我们的例子中， index矩阵中存放的是索引，而索引必不可能重复，而index矩阵中全为1， 因此index矩阵必定只有1行。
+                        
+                        - 所以，整句代码的作用相当于 把整个logits矩阵映射到了logits矩阵的第1行
+                    '''
+                    
                     loss_fct = nn.CrossEntropyLoss()
                     loss = loss_fct(labeled_logits.view(-1, self.num_labels), labels.view(-1))
                 
