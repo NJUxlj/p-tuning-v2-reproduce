@@ -1771,7 +1771,7 @@ class DebertaForTokenClassification(DebertaPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.deberta(
+        outputs = self.deberta.forward(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1790,17 +1790,31 @@ class DebertaForTokenClassification(DebertaPreTrainedModel):
         loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
+            # Only keep active parts of the loss
+            # attention_mask 用于忽略填充位置的损失计算。
+            # active_loss 是一个布尔张量，指示哪些位置是有效的（值为 1）。
+            # active_logits 和 active_labels 分别是有效位置的预测值和真实值，用于计算损失。
             
+            if attention_mask is not None: # 如果提供了 attention_mask，则只计算有效位置的损失
+                # attention_mask.shapew = (bz, seqlen)
+                active_loss = attention_mask.view(-1) == 1 # shape = (bz*seqlen, )
+                active_logits = logits.view(-1, self.num_labels) #shape = (bz*seqlen, n_labels)
+                # where: 如果condition成立，就返回第一个tensor中的值，否则返回第二个tensor中的值
+                active_labels =  torch.where(
+                    condition = active_loss, input = labels.view(-1), other = torch.tensor(loss_fct.ignore_index).type_as(labels)
+                ) # (bz*seqlen,)
             
+                loss = loss_fct(active_logits, active_labels)
             
-        else:
-            pass
+            else:
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
         
-        
+         
         
         
         if not return_dict:
-            pass
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
         
         
         return TokenClassifierOutput(
