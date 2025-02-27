@@ -1413,10 +1413,13 @@ class DebertaForMaskedLM(DebertaPreTrainedModel):
         self.init_weights()      
     
     def get_output_embeddings(self):
-        pass
+        '''
+        获取 LM Head (词表分类头, 实际上就是一个线性层)
+        '''
+        return self.cls.predictions.decoder
     
     def set_output_embeddings(self, new_embeddings):
-        pass
+        self.cls.predictions.decoder = new_embeddings
      
         
         
@@ -1448,7 +1451,7 @@ class DebertaForMaskedLM(DebertaPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.deberta(
+        outputs = self.deberta.forward(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1459,9 +1462,20 @@ class DebertaForMaskedLM(DebertaPreTrainedModel):
             return_dict=return_dict,
         )
         
-        sequence_output = outputs[0]
-        prediction_scores = self.cls(sequence_output) # shape=  (bz, seqlen, d)
+        sequence_output = outputs[0] # last_hidden_state
+        prediction_scores = self.cls(sequence_output) # shape=  (bz, seqlen, vocab_size)
         
+        '''
+        只有 [MASK] 位置的标签会被用于计算 loss
+        
+        在labels中， 除了 [MASK] token的其他位置，全部被标为 -100
+        
+         [MASK] 位置的处理
+        在输入数据的预处理阶段，通常会将 [MASK] 位置的标签设置为实际的目标词索引，而非 [MASK] 的位置会被设置为 -100。因此：
+
+        [MASK] 位置的标签值在 [0, vocab_size) 范围内，会参与 loss 计算。
+        非 [MASK] 位置的标签值为 -100，会被 CrossEntropyLoss 忽略。
+        '''
         masked_lm_loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss() # -100 index = padding token
@@ -1568,7 +1582,7 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
 
         self.deberta = DebertaModel(config)
         self.pooler = ContextPooler(config)
-        output_dim = self.pooler.output_dim
+        output_dim = self.pooler.output_dim 
 
         self.classifier = nn.Linear(output_dim, num_labels)
         drop_out = getattr(config, "cls_dropout", None)
@@ -1599,7 +1613,7 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.deberta(
+        outputs = self.deberta.forward(
             input_ids,
             token_type_ids=token_type_ids, 
             attention_mask=attention_mask,
@@ -1610,24 +1624,76 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
             return_dict=return_dict,
         )
 
-        encoder_layer = outputs[0]
+        encoder_layer = outputs[0] # shape = (B, L, D)
+        pooled_output = self.pooler(encoder_layer) # pooler 会自动取最后一个 token
+        pooled_output = self.dropout(pooled_output) # shape = (B, D)
+        logits = self.classifier(pooled_output) # shape = (B, num_labels)
         
         
         loss = None
+        '''
+        任务类型判断：
+            如果 self.num_labels == 1，说明是一个回归任务。
+            如果 labels 是一维向量或者最后一维的大小为 1，则是一个分类任务。
+            否则，假设是一个多标签分类任务。
         
+        根据任务类型，选择适当的损失函数并计算损失：
+            回归任务使用均方误差损失（MSELoss）。
+            分类任务使用交叉熵损失（CrossEntropyLoss）。
+            多标签分类任务使用 LogSoftmax 和加权损失。
+        '''
         if labels is not None:
-            pass
-        
-        
-        
-        else:
-            pass
+            if self.num_labels==1:
+                # regression
+                loss_fn = nn.MSELoss()
+            elif labels.dim()==1 or labels.size(-1)==1: # single-label classification
+                # nonzero(): 返回张量中值为True的元素的索引
+                label_index = (labels >= 0).nonzero() # shape = (sb, ) or (sb, 1), where sb is the number of non-negative labels,  and is <=  batch size
+                labels = labels.long()
+                if label_index.size(0)>0:
+                    # gather 用于使用 label_index 作为索引，从 logits 中提取有效部分（即标签不为负的样本）。
+                    # logits.shape  =(B, num_labels)
+                    # index.shape = (B, num_labels)
+                    labeled_logits = torch.gather(logits, 0, index=label_index.expand(label_index.size(0), logits.size(1)))  # shape =  (sb, num_labels)
+                    labels = torch.gather(labels, 0, label_index.view(-1)) #shape = (sb, )
+                    
+                    loss_fct = nn.CrossEntropyLoss()
+                    loss = loss_fct(labeled_logits.view(-1, self.num_labels), labels.view(-1))
+                
+                else:
+                    # 如果所有标签均为负（无效标签），则直接返回零损失。
+                    
+                    loss =  torch.tensor(0).to(logits)
+                
+    
+            else: # multi-label classification
+                '''
+                LogSoftmax数学公式：
+                    - 对于样本 x 中的每个元素 xi，LogSoftmax 函数的计算公式如下：
+                    - LogSoftmaxqq(xi) =  log(exp(xi) / Σj exp(xj))
+                    - 其中，exp(xj) 表示 xj 的指数函数。
+                    - 这个公式的含义是，对于每个样本，LogSoftmax 函数将每个元素的对数减去了该样本中所有元素的对数和。
+                
+                多标签分类loss计算：
+                    - 对于多标签分类任务，通常使用 LogSoftmax 函数将模型的输出转换为概率分布。
+                    - 然后，使用加权损失函数（例如交叉熵损失）来计算损失。
+                    - 加权损失函数会根据每个样本的标签权重来调整损失，以平衡不同标签的重要性。
+                    
+                    Loss = -(1/N) Σ{i=1 to N} Σ{j=1 to C} wij * log_softmax(xi) * yi
+                    - 其中，wij 是标签权重，yi 是样本 i 的标签，log_softmax(xi) 是 LogSoftmax 函数的输出。
+                    - 这个公式的含义是，对于每个样本，我们计算每个标签的加权损失，并将它们相加得到最终的损失。
+                '''
+                
+                # logits.shape = (B, num_labels)
+                log_softmax = nn.LogSoftmax(dim=-1)
+                loss = -(log_softmax(logits)* labels).sum(-1).mean() # shape = (B, )
         
         
         
         
         if not return_dict:
-            pass
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
         
         
         return SequenceClassifierOutput(
