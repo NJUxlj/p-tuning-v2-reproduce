@@ -369,6 +369,45 @@ class DebertaLayer(nn.Module):
         rel_embeddings = None,
         past_key_value = None,
     ):
+        '''
+        ##Args:
+            :param: hidden_states, shape = [bz, seq_len, d]
+            :param: attention_mask, shape = [bz, seq_len]
+            :param: return_att, bool
+            :param: query_states, shape = [bz, seq_len, d]
+            :param: relative_pos, shape = [1, q_size, k_size], 功能：计算相对位置编码
+            :param: rel_embeddings, shape = [2k, d]， 功能：计算相对位置编码
+            :param: past_key_value, shape = [n_layers, bz, seq_len, d]
+            
+            
+        ##Fucntion:
+            rel_embeddings 通常是相对位置嵌入矩阵 R，
+                        它包含了相对位置之间的关系信息，用于增强模型对相对位置的建模能力。
+
+                    
+                以下是标准注意力+相对位置嵌入：
+
+                \[
+                \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T + QR^T}{\sqrt{d_k}}\right)V
+                \]
+            
+            
+            
+            1. relative_pos（相对位置索引）
+            relative_pos 是一个张量，其形状通常为 [1, query_size, key_size]。
+                它表示查询序列中每个位置与键序列中每个位置之间的相对位置。具体来说，对于查询序列中的每个位置 q 和键序列中的每个位置 k，relative_pos 存储了 q - k 的值。这个相对位置信息有助于模型捕捉序列中元素之间的相对位置关系。
+
+            2. relative_embedding（相对位置嵌入）
+            relative_embedding 是一个张量，其形状通常为 [2 * max_relative_positions, hidden_size]。
+                它是一个预定义的嵌入矩阵，用于将相对位置索引 relative_pos 映射到一个高维向量空间中。这个嵌入矩阵包含了相对位置之间的关系信息，用于增强模型对相对位置的建模能力。
+
+            两者之间的关系
+            relative_pos 是一个整数索引矩阵，用于从 relative_embedding 中查找对应的相对位置嵌入向量。具体来说，对于 relative_pos 中的每个元素 i，我们可以通过 relative_embedding[i + max_relative_positions] 来获取对应的相对位置嵌入向量。
+
+            换言之：
+                relative_pos用于提供相对位置， relative_embedding提供了相对位置的嵌入表示
+                    
+        '''
         attention_output = self.attention.forward(
             hidden_states,
             attention_mask,
@@ -453,6 +492,13 @@ class DebertaEncoder(nn.Module):
         '''
         ## Param:
         :param: hidden_states, shape = [n_layers, bz, seq_len, d]
+        
+        ## Return: 
+            return BaseModelOutput( 
+                last_hidden_state=hidden_states,  
+                hidden_states=all_hidden_states,  # dtype = Tuple[Tensor] shape = [n_layers, bz, seq_len, d] 
+                attentions=all_attentions, 
+            )
         '''
         attention_mask = self.get_attention_mask(attention_mask) # 把掩码的形状规范化到4维 [bz, 1, seq_len, seq_len]
         relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos) # shape = [1, q, k]
@@ -840,9 +886,14 @@ class DisentangledSelfAttention(nn.Module):
             1. 计算相对位置的编码
             2. 计算相对位置的注意力分数
             3. 计算注意力分数
+            
+        relative_pos：存储了 token i 和 token j 之间的相对位置
+        rel_embeddings： 提供了相对位置 f(i-j) 的嵌入表示
+        
+        
         ## Args:
-            query_layer.shape = key_layer.shape = value_layer.shape = [bz, num_heads, seq_len, head_size]
-            relative_pos.shape = [bz, seq_len, seq_len]
+            query_layer.shape = key_layer.shape = value_layer.shape = [bz, num_heads, query_size, head_size]
+            relative_pos.shape = [bz, seq_len, seq_len] or [1, query_size, key_size]
             rel_embeddings.shape = [2k, d]
             
         ##Return:
@@ -885,12 +936,13 @@ class DisentangledSelfAttention(nn.Module):
         score = 0
         # content->position
         if "c2p" in self.pos_att_type:
-            # query_layer.shape = [bz, num_heads, seq_len, head_size]
-            # pos_key_layer.shape = [1, 2k, num_heads, head_size]
-            c2p_att = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2)) # 广播乘法 shape = [max(bz, 1), max(num_heads, 2k), seq_len, num_heads]
+            # query_layer.shape = [bz, num_heads, q_len, head_size]
+            # pos_key_layer.shape = [1, num_heads, 2k, head_size]
+            # 计算 Q x R^T
+            c2p_att = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2)) # 广播乘法 shape = [bz, num_heads, q_len, 2k]
 
             # relative_pos.shape = (1, 1, q_size, k_size)
-            # query_layer.shape = [bz, num_heads, seq_len, head_size]
+            # query_layer.shape = [bz, num_heads, q_len, head_size]
             # torch.clamp 是一个 PyTorch 函数，用于将张量中的值限制在指定范围内
             # 这里，将 relative_pos + att_span 的值限制在 [0, 2*att_span-1] 范围内
             c2p_pos = torch.clamp(relative_pos + att_span, 0, att_span * 2 - 1) # 将相对位置索引映射到一个非负范围
@@ -899,7 +951,10 @@ class DisentangledSelfAttention(nn.Module):
             # 它从指定维度（dim=-1）中，根据提供的 index 张量提取对应的值。
             # 这一行的作用是，从 c2p_att 中提取与动态位置索引（由 c2p_dynamic_expand 生成）对应的注意力分数。
             # 对应解耦注意力中 K_r的下标：delta(i,j)， 把c2p[i,j] 替换成 c2p[i][delta(i,j)}, delta就是index矩阵
-            c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_dynamic_expand(c2p_pos, query_layer, relative_pos)) # index.shape = [bz, num_heads, seq_len, k_size]
+            c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_dynamic_expand(c2p_pos, query_layer, relative_pos)) # index.shape = [bz, num_heads, q_size, k_size]
+            
+            # 上面这句代码的本质就是使用 rel_pos 的信息来重新分配  Q x R^T 矩阵中的值
+            
             score += c2p_att
 
         # position->content
@@ -1013,9 +1068,46 @@ class DebertaEmbeddings(nn.Module):
         if position_ids is None:
             position_ids = self.position_ids[:, past_key_values_length: past_key_values_length+ seq_length]
         
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device = self.position_ids.device)
         
         
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+            
         
+        if self.position_embeddings is not None:
+            position_embeddings = self.position_embeddings(position_ids)
+        else:
+            position_embeddings = torch.zeros_like(inputs_embeds)
+        
+        
+        embeddings = inputs_embeds
+        
+        if self.position_biased_input:
+            embeddings+=position_embeddings
+        if self.config.type_vocab_size >0:
+            embeddings += self.token_type_embeddings(token_type_ids)
+            
+        if self.embedding_size != self.config.hidden_size:
+            embeddings = self.embed_proj(embeddings)
+            
+            
+        embeddings = self.LayerNorm(embeddings)
+        
+        # embeddings 中的每个hidden unit都需要分配一个掩码
+        if mask is not None:
+            if mask.dim() != embeddings.dim():
+                if mask.dim()==4:
+                    mask = mask.squeeze(1).squeeze(1)
+                mask = mask.unsqueeze(2) # shape = (b, L, 1)
+            mask = mask.to(embeddings.device)
+
+            embeddings = embeddings * mask
+        embeddings  = self.dropout(embeddings)
+        return embeddings
+        
+
         
         
         
@@ -1188,7 +1280,123 @@ class DebertaModel(DebertaPreTrainedModel):
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        
+        elif input_ids is not None:
+            input_shape = input_ids.shape()
+            batch_size, seq_length = input_shape
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.shape()[:-1]
+            batch_size, seq_length = input_shape
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        
+        
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        
+        # input_embedding 的 填充掩码 (只能约束前缀之后的token)
+        embedding_mask = attention_mask[:, past_key_values_length:].contiguous()
+        
+        
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length+past_key_values_length), device = device)
 
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+            
+        embedding_output = self.embeddings.forward(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            mask = embedding_mask,
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
+        
+        encoder_outputs = self.encoder.forward(
+            embedding_output,
+            attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=return_dict,
+            past_key_values=past_key_values,
+        )
+        
+        
+        encoded_layers:Tuple[torch.Tensor] = encoder_outputs[1] # 获取所有层的hidden_states
+        
+        '''
+        实现一个多步（z_steps > 1）的递归计算，
+        其中每一步使用 Transformer encoder 的最后一层（self.encoder.layer[-1]）对输入进行迭代处理
+        
+        这种机制可能是为了增强某些特定任务（如序列建模、生成任务、强化学习等）对输入特征的捕获能力。
+        
+        在多步计算中，每一步都可能基于前一步的输出进行更新，以逐渐优化特征表示。
+            复制层的操作可能是为了在递归计算中重复利用相同的参数，从而节省模型的存储和计算开销
+
+        通常，最后一层的输出（encoded_layers[-1]）用于最终预测，
+        但在某些任务中，倒数第二层的输出（encoded_layers[-2]）也可能被用于进一步处理。
+        '''
+        if self.z_steps > 1:
+            hidden_states = encoded_layers[-2]
+            layers:List[DebertaLayer] = [self.encoder.layer[-1] for _ in range(self.z_steps)]
+            '''
+            self.encoder.layer[-1] 是 Transformer 编码器的最后一层。
+            通过复制这层多次（for _ in range(self.z_steps)），模型在后续步骤中可以多次使用这层进行递归计算。
+            '''
+            query_states  = encoded_layers[-1]
+            rel_embeddings = self.encoder.get_rel_embedding()
+            attention_mask  = self.encoder.get_attention_mask(attention_mask)
+            rel_pos = self.encoder.get_rel_pos(embedding_output) # shape = (1, q_size, k_size)
+            
+            for layer in layers[1:]:
+                query_states = layer.forward(
+                    hidden_states,  
+                    attention_mask,     
+                    return_att=False,  
+                    query_states=query_states,  
+                    relative_pos=rel_pos,     # rel_pos 用于表示查询序列和键序列之间的相对位置，rel_embeddings 用于提供相对位置的嵌入表示。
+                    rel_embeddings=rel_embeddings,  
+                )
+                encoded_layers.append(query_states)
+                
+                
+                '''
+                query_states 通常是查询矩阵 Q
+                    在相对位置嵌入机制中，query_states 会叠加相对位置的偏置项 rel_embeddings，以增强查询矩阵的特征表示能力。
+
+                rel_embeddings 通常是相对位置嵌入矩阵 R，
+                    它包含了相对位置之间的关系信息，用于增强模型对相对位置的建模能力。
+
+                    
+                以下是标准注意力+相对位置嵌入：
+
+                \[
+                \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T + QR^T}{\sqrt{d_k}}\right)V
+                \]
+
+                '''
+        
+        sequence_output = encoded_layers[-1]
+        
+        
+        if not return_dict:
+            return  (sequence_output,) + encoder_outputs[1 if output_hidden_states else 2:]
+
+        return BaseModelOutput(
+            last_hidden_state = sequence_output,
+            hidden_states = encoder_outputs.hidden_states if output_hidden_states else None,
+            attentions = encoder_outputs.attentions,
+        )
 
 
 @add_start_docstrings("""DeBERTa Model with a `language modeling` head on top. """, DEBERTA_START_DOCSTRING)
